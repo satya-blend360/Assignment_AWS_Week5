@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Sales Analytics Serverless API - Complete Stack'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket containing sales data
+    Default: sales-analytics-data-bucket
+  
+  S3KeyPath:
+    Type: String
+    Description: S3 key path to the CSV file
+    Default: etl-output/Cleaned_Amazon_Sale_Report.csv
+  
+  ScheduleExpression:
+    Type: String
+    Description: EventBridge schedule expression
+    Default: cron(0 8 * * ? *)
+    
+Resources:
+  # S3 Bucket for Sales Data
+  SalesDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: SalesAnalytics
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SalesAnalyticsLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SalesDataBucket.Arn
+                  - !Sub '${SalesDataBucket.Arn}/*'
+
+  # Lambda Function
+  SalesAnalyticsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SalesAnalyticsAPI
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          S3_KEY: !Ref S3KeyPath
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Deploy actual code'})
+              }
+      Tags:
+        - Key: Project
+          Value: SalesAnalytics
+
+  # CloudWatch Log Group
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SalesAnalyticsFunction}'
+      RetentionInDays: 30
+
+  # API Gateway REST API
+  SalesAnalyticsAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: SalesAnalyticsAPI
+      Description: Sales Analytics API Gateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  AnalyticsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SalesAnalyticsAPI
+      ParentId: !GetAtt SalesAnalyticsAPI.RootResourceId
+      PathPart: analytics
+
+  # API Gateway Method
+  AnalyticsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SalesAnalyticsAPI
+      ResourceId: !Ref AnalyticsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SalesAnalyticsFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: AnalyticsGetMethod
+    Properties:
+      RestApiId: !Ref SalesAnalyticsAPI
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SalesAnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SalesAnalyticsAPI}/*/*'
+
+  # EventBridge Rule for Scheduled Execution
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SalesAnalyticsDailySchedule
+      Description: Daily sales analytics refresh
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SalesAnalyticsFunction.Arn
+          Id: SalesAnalyticsTarget
+
+  # Lambda Permission for EventBridge
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SalesAnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  # CloudWatch Dashboard
+  SalesAnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: SalesAnalyticsDashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum", "label": "Invocations"}],
+                  [".", "Errors", {"stat": "Sum", "label": "Errors"}],
+                  [".", "Duration", {"stat": "Average", "label": "Avg Duration"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "SOURCE '${LambdaLogGroup}'\n| fields @timestamp, @message\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Lambda Logs"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${SalesAnalyticsAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/analytics'
+    Export:
+      Name: SalesAnalyticsApiEndpoint
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt SalesAnalyticsFunction.Arn
+    Export:
+      Name: SalesAnalyticsLambdaArn
+
+  S3BucketName:
+    Description: S3 Bucket for sales data
+    Value: !Ref SalesDataBucket
+    Export:
+      Name: SalesAnalyticsS3Bucket
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: SalesAnalyticsLogGroup
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SalesAnalyticsDashboard}'
